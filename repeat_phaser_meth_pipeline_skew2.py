@@ -13,23 +13,34 @@
 #              6. Output phased BAM and analysis files into structured directories per input BAM.
 #              7. Generate a consolidated summary report for all processed BAMs with detailed phasing stats.
 
-import pysam
+# --- Standard library imports ---
 import argparse
+import datetime
+import os
+import re
+import subprocess
 import sys
+
+# --- Third-party library imports ---
+# These must be installed via pip: pip install pysam numpy scikit-learn scipy pandas
 import numpy as np
-from sklearn.cluster import KMeans 
+import pandas as pd
+import pysam
 from scipy.stats import mannwhitneyu, chi2, ttest_ind_from_stats
-import subprocess 
-import pandas as pd 
-import os 
-import re 
-import datetime 
+from sklearn.cluster import KMeans
+
+# --- Function Definitions ---
 
 def parse_genomic_region(region_str):
     """
-    Parses a genomic region string (e.g., "chr1:100-200") into
-    chromosome, start (0-based inclusive), and end (1-based inclusive, suitable for BED).
-    The end coordinate is also suitable as the exclusive end for pysam's 0-based fetching.
+    Parses a genomic region string (e.g., "chr1:100-200") into a standardized format.
+
+    Args:
+        region_str (str): Genomic region string in "chr:start-end" format (1-based inclusive).
+
+    Returns:
+        tuple: (chromosome, 0-based_start, 1-based_inclusive_end) or None if parsing fails.
+               The end coordinate is suitable for both BED format and as the exclusive end for pysam's 0-based fetching.
     """
     try:
         chrom_part, range_part = region_str.split(':', 1)
@@ -52,29 +63,52 @@ def sanitize_region_for_filename(region_str):
 
 def get_aligned_read_segment_in_region(read, region_chrom, region_start_0, region_end_0_exclusive):
     """
-    Extracts the portion of the read sequence that aligns within the specified reference region.
+    Extracts the portion of the read's sequence that aligns within a specified reference region.
+    This function correctly handles insertions and deletions in the read's CIGAR string.
+
+    Args:
+        read (pysam.AlignedSegment): The read object.
+        region_chrom (str): Chromosome of the region.
+        region_start_0 (int): 0-based start coordinate of the region.
+        region_end_0_exclusive (int): 0-based exclusive end coordinate of the region.
+
+    Returns:
+        tuple: (aligned_segment_string, count_of_aligned_reference_bases_in_region)
     """
     if read.reference_name != region_chrom:
         return "", 0
     aligned_segment_chars = []
     aligned_ref_bp_count = 0
+    # get_aligned_pairs maps each base in the read to its corresponding reference position.
     for q_idx, r_idx in read.get_aligned_pairs(matches_only=False, with_seq=False):
         if r_idx is not None and region_start_0 <= r_idx < region_end_0_exclusive:
             aligned_ref_bp_count +=1 
-            if q_idx is not None: 
+            if q_idx is not None: # If q_idx is None, it's a deletion in the read.
                 aligned_segment_chars.append(read.query_sequence[q_idx])
     return "".join(aligned_segment_chars), aligned_ref_bp_count
 
 def count_repeats_in_read_segment(read, rep_chrom, rep_start_0, rep_end_0_exclusive, 
                                   motif, min_overlap_bp):
     """
-    Counts occurrences of a motif within the part of the read aligned to the RE region.
+    Counts non-overlapping occurrences of a motif within the part of the read aligned to the RE region.
+
+    Args:
+        read (pysam.AlignedSegment): The read object.
+        rep_chrom (str): Chromosome of the repetitive element.
+        rep_start_0 (int): 0-based start of the repetitive element region.
+        rep_end_0_exclusive (int): 0-based exclusive end of the repetitive element region.
+        motif (str): The motif sequence to count (e.g., "CAG").
+        min_overlap_bp (int): Minimum number of base pairs the read must align within the RE region.
+
+    Returns:
+        int or np.nan: The count of the motif, or np.nan if criteria are not met.
     """
     if read.is_unmapped or read.reference_name != rep_chrom:
         return np.nan
     read_ref_start, read_ref_end = read.reference_start, read.reference_end
     if not (max(read_ref_start, rep_start_0) < min(read_ref_end, rep_end_0_exclusive)):
-        return np.nan
+        return np.nan # No overlap
+    
     aligned_segment, aligned_ref_bases = get_aligned_read_segment_in_region(
         read, rep_chrom, rep_start_0, rep_end_0_exclusive
     )
@@ -84,7 +118,8 @@ def count_repeats_in_read_segment(read, rep_chrom, rep_start_0, rep_end_0_exclus
 
 def run_modbamtools_plot(phased_bam_path_abs, plot_region_str, analysis_dir, plot_basename_prefix):
     """
-    Calls `modbamtools plot`.
+    Calls the external `modbamtools plot` command to generate methylation plots.
+    The command is run from within the specified analysis_dir to keep outputs organized.
     """
     sys.stdout.write(f"\n  Running modbamtools plot for region {plot_region_str}...\n")
     cmd = ["modbamtools", "plot", phased_bam_path_abs, "-r", plot_region_str, "-o", ".", "-p", plot_basename_prefix, "--hap"]
@@ -101,7 +136,9 @@ def run_modbamtools_plot(phased_bam_path_abs, plot_region_str, analysis_dir, plo
 
 def run_modbamtools_calc_meth(phased_bam_path_abs, bed_file_path_abs, analysis_dir, calc_meth_output_filename):
     """
-    Calls `modbamtools calcMeth`.
+    Calls the external `modbamtools calcMeth` command to calculate methylation statistics.
+    The command is run from within the specified analysis_dir.
+    Returns the full path to the expected output .txt file, or None if an error occurs.
     """
     sys.stdout.write(f"\n  Running modbamtools calcMeth using BED file {bed_file_path_abs}...\n")
     cmd = ["modbamtools", "calcMeth", "-b", bed_file_path_abs, "-hp", "-o", calc_meth_output_filename, phased_bam_path_abs]
@@ -178,6 +215,7 @@ def analyze_calc_meth_output(meth_file_path, min_coverage_diff_meth=5, low_meth_
                                    nobs1 < min_coverage_diff_meth or nobs2 < min_coverage_diff_meth)
             
             if can_calculate_stats:
+                # Welch's t-test for differential methylation
                 if not (pd.isna(std1) or pd.isna(std2) or std1 < 0 or std2 < 0): 
                     try:
                         if nobs1 >= 2 and nobs2 >= 2 : 
@@ -188,6 +226,7 @@ def analyze_calc_meth_output(meth_file_path, min_coverage_diff_meth=5, low_meth_
                     except Exception: p_value_str = f"NA (T-test error)"
                 else: p_value_str = "NA (std issue)"
                 
+                # Methylation Percent Change Skewness
                 m1_calc, m2_calc = mean1, mean2 
                 if m1_calc < low_meth_threshold and m2_calc < low_meth_threshold:
                     methylation_skew_display_str = "LowMeth"
@@ -276,7 +315,7 @@ def process_single_bam(input_bam_path, args, parsed_rep_elements_template, num_r
     phasing_summary_data = {
         "input_bam": input_bam_path, "reads_in_output_region": 0, "reads_for_phasing_definition": 0,
         "H1_reads_phased": 0, "H2_reads_phased": 0, "phasing_combined_p_value": np.nan, 
-        "phasing_stats_per_re": [], # To store detailed phasing stats for summary
+        "phasing_stats_per_re": [], 
         "differential_methylation_results": [] }
 
     try:
@@ -354,8 +393,7 @@ def process_single_bam(input_bam_path, args, parsed_rep_elements_template, num_r
                     else: h1_label_idx = 1
                     if h1_label_idx != -1: 
                         clustering_ok = True; h2_label_idx = 1 - h1_label_idx
-                        # Don't print stats here, they go in the summary report
-                        individual_p_values = []
+                        sys.stdout.write("\n--- Phasing Results for this BAM ---\n"); individual_p_values = []
                         for idx, item in enumerate(reads_for_clustering):
                             if cluster_labels_for_subset[idx] == h1_label_idx: qname_to_hap_int[item['qname']] = 1 
                             elif cluster_labels_for_subset[idx] == h2_label_idx: qname_to_hap_int[item['qname']] = 2
@@ -374,7 +412,7 @@ def process_single_bam(input_bam_path, args, parsed_rep_elements_template, num_r
                                         if not np.isnan(p_value) and 0<p_value<1: individual_p_values.append(p_value)
                                 except ValueError: pass 
                             re_stats_list_for_summary.append({
-                                "motif": current_parsed_re_elements[re_idx]['motif'], # Added motif for header generation
+                                "motif": current_parsed_re_elements[re_idx]['motif'],
                                 "h1_stats_str": f"{np.mean(valid_h1):.1f} ({int(np.min(valid_h1))}-{int(np.max(valid_h1))})" if len(valid_h1)>0 else "NA",
                                 "h2_stats_str": f"{np.mean(valid_h2):.1f} ({int(np.min(valid_h2))}-{int(np.max(valid_h2))})" if len(valid_h2)>0 else "NA",
                                 "mwu_p_value": p_value
@@ -497,7 +535,6 @@ def generate_master_summary_report(all_summaries, base_output_dir):
     sys.stdout.write("====================================================================================================================================================\n") 
 
     report_lines = []
-    # --- Dynamically create the header ---
     static_header = ["Input_BAM", "Reads_in_Region", "Reads_for_Phasing", "H1_Phased_Reads", "H2_Phased_Reads", "Phasing_P_Value"]
     dynamic_header = []
     if all_summaries and all_summaries[0].get('phasing_stats_per_re'):
@@ -509,7 +546,6 @@ def generate_master_summary_report(all_summaries, base_output_dir):
     full_header = static_header + dynamic_header + meth_header
     report_lines.append("\t".join(full_header))
     
-    # --- Prepare for console output ---
     col_widths = {"Input_BAM": 30, "Reads_in_Region":10, "Reads_for_Phasing":10, "H1_Phased_Reads":10, "H2_Phased_Reads":10, "Phasing_P_Value": 12, 
                   "BED_Region": 25, "H1_Avg_Meth(%)": 15, "H1_StdDev":10, "H1_Coverage": 12, 
                   "H2_Avg_Meth(%)": 15, "H2_StdDev":10, "H2_Coverage": 12, 
@@ -528,7 +564,6 @@ def generate_master_summary_report(all_summaries, base_output_dir):
             col_widths[f"RE{i+1}_H1"] = 18
             col_widths[f"RE{i+1}_H2"] = 18
             col_widths[f"RE{i+1}_P"] = 12
-            # Corrected f-string syntax
             console_header_parts.extend([
                 f"{re_label}_H1_Counts".center(col_widths[f'RE{i+1}_H1']),
                 f"{re_label}_H2_Counts".center(col_widths[f'RE{i+1}_H2']),
@@ -576,7 +611,6 @@ def generate_master_summary_report(all_summaries, base_output_dir):
                     row_parts_file.extend([bam_name_short, reads_out_reg, reads_phasing, h1_phased_count, h2_phased_count, phasing_p])
                     for re_idx, re_stat in enumerate(re_stats):
                         mwu_p_val_str = f"{re_stat.get('mwu_p_value', np.nan):.3g}" if pd.notna(re_stat.get('mwu_p_value')) else "NA"
-                        # Corrected f-string syntax here too
                         row_parts_console.extend([
                             f"{re_stat.get('h1_stats_str', 'NA'):>{col_widths[f'RE{re_idx+1}_H1']}}",
                             f"{re_stat.get('h2_stats_str', 'NA'):>{col_widths[f'RE{re_idx+1}_H2']}}",
@@ -623,7 +657,6 @@ def generate_master_summary_report(all_summaries, base_output_dir):
             
             for re_idx, re_stat in enumerate(re_stats):
                 mwu_p_val_str = f"{re_stat.get('mwu_p_value', np.nan):.3g}" if pd.notna(re_stat.get('mwu_p_value')) else "NA"
-                # Corrected f-string syntax here too
                 row_parts_console.extend([
                     f"{re_stat.get('h1_stats_str', 'NA'):>{col_widths[f'RE{re_idx+1}_H1']}}",
                     f"{re_stat.get('h2_stats_str', 'NA'):>{col_widths[f'RE{re_idx+1}_H2']}}",
